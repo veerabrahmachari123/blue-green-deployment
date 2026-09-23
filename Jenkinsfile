@@ -3,9 +3,9 @@
 // A green build here means: a new immutably-tagged image was built from a
 // known Git commit, started alongside the currently-live color, proven
 // healthy AND functionally correct (DB reachable, identity verified), and
-// ONLY THEN promoted by switching router traffic — with the previous
-// color removed only after that promotion is confirmed. Any failure before
-// promotion leaves production completely untouched.
+// ONLY THEN promoted by switching router traffic.
+//
+// Any failure before promotion leaves production untouched.
 
 pipeline {
 
@@ -25,44 +25,45 @@ pipeline {
         ROUTER_CONTAINER = 'orders-router'
         DB_CONTAINER = 'orders-db'
 
-        // IMPORTANT FOR WINDOWS JENKINS + GIT BASH
+        // IMPORTANT:
+        // Do NOT set MSYS_NO_PATHCONV globally.
         //
-        // Git Bash/MSYS automatically converts Unix-style paths such as
-        // /app into Windows paths before passing them to Docker.
-        //
-        // Example of the broken behavior:
+        // Docker commands that use Linux/container paths such as:
         //     -w /app
-        // becomes:
-        //     -w C:/Program Files/Git/app
         //
-        // This causes Docker to fail with:
-        // "the working directory 'C:/Program Files/Git/app' is invalid"
+        // need MSYS_NO_PATHCONV=1.
         //
-        // Disable MSYS path conversion so Docker receives Unix container
-        // paths exactly as intended.
-        MSYS_NO_PATHCONV = '1'
+        // But docker build on Windows needs Git Bash to convert:
+        //     /c/ProgramData/...
+        //
+        // into:
+        //     C:/ProgramData/...
+        //
+        // Therefore MSYS_NO_PATHCONV is enabled only on the
+        // docker run command in the Unit/Application Test stage.
 
-        // Secret is bound to a file at runtime and never echoed.
         SECRET_ENV_FILE = "${WORKSPACE}/scripts/secrets/orders-api.env"
     }
 
     options {
         timestamps()
 
-        // Prevent two deployments from racing each other / creating
-        // uncontrolled duplicate candidate containers.
         disableConcurrentBuilds()
 
-        buildDiscarder(logRotator(numToKeepStr: '30'))
+        buildDiscarder(
+            logRotator(numToKeepStr: '30')
+        )
     }
 
     stages {
 
         stage('Checkout') {
             steps {
+
                 checkout scm
 
                 script {
+
                     env.GIT_COMMIT_SHA = sh(
                         script: 'git rev-parse HEAD',
                         returnStdout: true
@@ -83,11 +84,15 @@ pipeline {
 
                 script {
                     if (!params.APP_VERSION?.trim()) {
-                        error("APP_VERSION parameter is required, e.g. -PAPP_VERSION=7.9")
+                        error(
+                            "APP_VERSION parameter is required, e.g. APP_VERSION=7.9"
+                        )
                     }
                 }
 
-                sh "chmod +x scripts/*.sh"
+                sh '''
+                    chmod +x scripts/*.sh
+                '''
 
                 sh """
                     scripts/validate-version.sh \
@@ -99,22 +104,6 @@ pipeline {
 
         stage('Unit/Application Test') {
             steps {
-
-                // Runs inside a throwaway node:20-alpine container rather
-                // than requiring Node.js to be installed on the Jenkins host.
-                //
-                // MSYS_NO_PATHCONV=1 is set globally above because this
-                // Jenkins agent is running on Windows through Git Bash.
-                //
-                // Without it Git Bash changes:
-                //
-                //     -w /app
-                //
-                // into:
-                //
-                //     -w C:/Program Files/Git/app
-                //
-                // which causes Docker exit code 125.
 
                 sh '''
                     set -e
@@ -139,7 +128,18 @@ pipeline {
 
                     echo "Running Node.js tests inside node:20-alpine..."
 
-                    docker run --rm \
+                    # IMPORTANT:
+                    # This flag is scoped ONLY to docker run.
+                    #
+                    # The Jenkins agent uses Windows + Git Bash.
+                    # Git Bash otherwise converts /app into:
+                    #
+                    # C:/Program Files/Git/app
+                    #
+                    # which causes Docker to reject the container
+                    # working directory.
+
+                    MSYS_NO_PATHCONV=1 docker run --rm \
                         -v "${WORKSPACE}/app:/app" \
                         -w /app \
                         node:20-alpine \
@@ -156,17 +156,38 @@ pipeline {
             steps {
 
                 script {
-                    env.IMAGE_TAG = sh(
+
+                    // IMPORTANT:
+                    // Do NOT pipe the build script through `tail`.
+                    //
+                    // A pipe can hide the exit code from docker build.
+                    // build-image.sh now fails immediately when Docker
+                    // fails and returns the immutable image tag on its
+                    // final line.
+
+                    def buildOutput = sh(
                         script: """
                             scripts/build-image.sh \
                                 '${params.APP_VERSION}' \
-                                '${env.GIT_COMMIT_SHA}' | tail -n1
+                                '${env.GIT_COMMIT_SHA}'
                         """,
                         returnStdout: true
                     ).trim()
-                }
 
-                echo "Built image: ${env.IMAGE_TAG}"
+                    def outputLines = buildOutput.readLines()
+
+                    if (outputLines.isEmpty()) {
+                        error("Docker build script returned no output.")
+                    }
+
+                    env.IMAGE_TAG = outputLines[-1].trim()
+
+                    if (!env.IMAGE_TAG) {
+                        error("Docker build did not return an image tag.")
+                    }
+
+                    echo "Built image: ${env.IMAGE_TAG}"
+                }
             }
         }
 
@@ -185,21 +206,6 @@ pipeline {
         stage('Start Candidate') {
             steps {
 
-                // On a real Jenkins controller the secret is bound from a
-                // Credentials file binding, e.g.:
-                //
-                // withCredentials([
-                //     file(
-                //         credentialsId: 'orders-api-secret-env',
-                //         variable: 'SECRET_ENV_FILE'
-                //     )
-                // ]) {
-                //     ...
-                // }
-                //
-                // Its contents never appear in the Jenkinsfile, SCM,
-                // or console log.
-
                 script {
 
                     def out = sh(
@@ -214,13 +220,18 @@ pipeline {
 
                     echo out
 
-                    out.split('\n').each { line ->
+                    out.split('\\n').each { line ->
 
                         if (line.contains('=')) {
 
-                            def (k, v) = line.split('=', 2)
+                            def parts = line.split('=', 2)
 
-                            env."${k}" = v
+                            if (parts.length == 2) {
+                                def key = parts[0].trim()
+                                def value = parts[1].trim()
+
+                                env."${key}" = value
+                            }
                         }
                     }
                 }
@@ -284,9 +295,9 @@ pipeline {
                         '${env.CURRENT_COLOR}'
                 """
 
-                sh """
+                sh '''
                     KEEP_LAST_N=3 scripts/cleanup-images.sh
-                """
+                '''
             }
         }
 
@@ -326,11 +337,11 @@ pipeline {
 
                 } else {
 
-                    echo "Failure occurred before a candidate color was determined (e.g. during Checkout/Validate/Build) - no candidate to roll back."
+                    echo "Failure occurred before a candidate color was determined - no candidate to roll back."
                 }
             }
 
-            echo "Diagnostic logs and container state were captured above for this failure (Phase 1/5/6 evidence)."
+            echo "Diagnostic logs and container state were captured above for this failure."
         }
 
         success {
@@ -340,12 +351,12 @@ pipeline {
 
         always {
 
-            sh """
+            sh '''
                 docker ps \
                     --filter name=orders- \
                     --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}' \
                     || true
-            """
+            '''
         }
     }
 }
