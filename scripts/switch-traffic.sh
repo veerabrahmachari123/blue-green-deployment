@@ -40,35 +40,57 @@ rm -f "$ROUTER_TMP"
 
 trap cleanup EXIT
 
-# Generate nginx configuration without a Bash heredoc.
+# Create the nginx configuration.
 
-# This avoids Git Bash interpreting nginx configuration syntax.
+#
 
-printf '%s\n' 
-'# Rewritten by scripts/switch-traffic.sh and loaded by nginx.' 
-"# ACTIVE_COLOR=${NEW_COLOR}" 
-'' 
-'upstream orders_active {' 
-"    server ${NEW_CONTAINER}:3000;" 
-'}' 
-'' 
-'server {' 
-'    listen 8080;' 
-'' 
-'    location /router-status {' 
-'        default_type text/plain;' 
-"        return 200 "active-color: ${NEW_COLOR}\n";" 
-'    }' 
-'' 
-'    location / {' 
-'        proxy_pass http://orders_active;' 
-'        proxy_set_header Host $host;' 
-'        proxy_set_header X-Real-IP $remote_addr;' 
-'        proxy_connect_timeout 2s;' 
-'        proxy_read_timeout 5s;' 
-'    }' 
-'}' 
-> "$ROUTER_TMP"
+# IMPORTANT:
+
+# We intentionally use a quoted heredoc delimiter so that
+
+# Git Bash does NOT interpret nginx's $host and $remote_addr.
+
+#
+
+# The color/container are replaced afterward.
+
+cat > "$ROUTER_TMP" <<'NGINX_CONFIG'
+
+# Rewritten by scripts/switch-traffic.sh and loaded by nginx.
+
+# ACTIVE_COLOR=**ACTIVE_COLOR**
+
+upstream orders_active {
+server **ACTIVE_CONTAINER**:3000;
+}
+
+server {
+listen 8080;
+
+```
+location /router-status {
+    default_type text/plain;
+    return 200 "active-color: __ACTIVE_COLOR__\n";
+}
+
+location / {
+    proxy_pass http://orders_active;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_connect_timeout 2s;
+    proxy_read_timeout 5s;
+}
+```
+
+}
+NGINX_CONFIG
+
+# Replace only our placeholders.
+
+sed -i 
+-e "s/**ACTIVE_COLOR**/${NEW_COLOR}/g" 
+-e "s/**ACTIVE_CONTAINER**/${NEW_CONTAINER}/g" 
+"$ROUTER_TMP"
 
 if [ ! -s "$ROUTER_TMP" ]; then
 fail "failed to generate router configuration"
@@ -78,10 +100,6 @@ log "Generated router configuration:"
 cat "$ROUTER_TMP"
 
 log "Installing active backend configuration into ${ROUTER_CONTAINER}"
-
-# Avoid docker cp because Git Bash on Windows can rewrite paths.
-
-# Send the file directly into the running nginx container.
 
 docker exec -i "$ROUTER_CONTAINER" 
 sh -c 'cat > /etc/nginx/conf.d/active-backend.conf' 
