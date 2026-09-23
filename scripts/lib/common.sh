@@ -43,15 +43,18 @@ color_port() {
 # router/active-backend.conf by switch-traffic.sh. This is the single
 # source of truth for "what is currently serving production traffic".
 current_active_color() {
-  if [ ! -f "$ROUTER_CONF" ]; then
-    fail "router config not found at $ROUTER_CONF"
+  local status
+  status=$(curl -fsS "http://localhost:8080/router-status") ||
+    fail "could not query router status"
+
+  status=$(printf '%s\n' "$status" |
+    sed -n 's/^active-color: //p')
+
+  if [ -z "$status" ]; then
+    fail "could not determine active color from router status"
   fi
-  local color
-  color=$(grep -m1 '^# ACTIVE_COLOR=' "$ROUTER_CONF" | cut -d= -f2 || true)
-  if [ -z "$color" ]; then
-    fail "could not determine active color from $ROUTER_CONF"
-  fi
-  echo "$color"
+
+  echo "$status"
 }
 
 container_exists() {
@@ -61,3 +64,4 @@ container_exists() {
 container_running() {
   [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || echo false)" = "true" ]
 }
+
