@@ -134,6 +134,36 @@ fi
 
 pass "production health is OK"
 
+# --------------------------------------------------
+# 4. Create deployment evidence
+# --------------------------------------------------
+
+log "Creating deployment evidence..."
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+EVIDENCE_DIR="${ROOT}/.evidence"
+MANIFEST="${EVIDENCE_DIR}/deployment-${VERSION}.json"
+
+mkdir -p "${EVIDENCE_DIR}"
+
+cat > "${MANIFEST}" <<EOF
+{
+  "version": "${ACTUAL_VERSION}",
+  "gitCommit": "${ACTUAL_COMMIT}",
+  "activeColor": "${ACTIVE_COLOR}",
+  "verifiedAt": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+  "router": "${ROUTER_URL}",
+  "routerStatusResponse": ${ROUTER_STATUS},
+  "versionResponse": ${VERSION_RESPONSE},
+  "healthResponse": ${HEALTH_RESPONSE}
+}
+EOF
+
+if [ ! -f "${MANIFEST}" ]; then
+    fail "deployment evidence file was not created"
+fi
+
+pass "deployment evidence created: ${MANIFEST}"
 log "========================================="
 log "DEPLOYMENT VERIFICATION SUCCESSFUL"
 log "========================================="
@@ -142,3 +172,4 @@ log "Version      : ${ACTUAL_VERSION}"
 log "Commit       : ${ACTUAL_COMMIT}"
 log "Router       : ${ROUTER_URL}"
 log "========================================="
+cat "${MANIFEST}"
