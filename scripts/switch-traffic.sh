@@ -1,36 +1,12 @@
 #!/usr/bin/env bash
 
-# Jenkins stage: Traffic Switch
-
-#
-
-# The router owns its active-backend.conf.
-
-# Jenkins must NOT rewrite a host-side file because the running
-
-# orders-router may have been created from a different workspace.
-
-#
-
-# This script:
-
-# 1. Generates the desired backend configuration.
-
-# 2. Copies it into orders-router.
-
-# 3. Validates nginx configuration.
-
-# 4. Reloads nginx.
-
-# 5. Verifies production traffic through host port 8080.
-
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$DIR/lib/common.sh"
 
 NEW_COLOR="${1:?usage: switch-traffic.sh <new_color> <expected_version>}"
-EXPECTED_VERSION="${2:?}"
+EXPECTED_VERSION="${2:?usage: switch-traffic.sh <new_color> <expected_version>}"
 
 case "$NEW_COLOR" in
 blue|green)
@@ -64,51 +40,60 @@ rm -f "$ROUTER_TMP"
 
 trap cleanup EXIT
 
-cat > "$ROUTER_TMP" <<EOF
+# Generate nginx configuration without a Bash heredoc.
 
-# Rewritten by scripts/switch-traffic.sh and loaded by nginx.
+# This avoids Git Bash interpreting nginx configuration syntax.
 
-# ACTIVE_COLOR=${NEW_COLOR}
-
-upstream orders_active {
-server ${NEW_CONTAINER}:3000;
-}
-
-server {
-listen 8080;
-
-```
-location /router-status {
-    default_type text/plain;
-    return 200 "active-color: ${NEW_COLOR}\n";
-}
-
-location / {
-    proxy_pass http://orders_active;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_connect_timeout 2s;
-    proxy_read_timeout 5s;
-}
-```
-
-}
-EOF
+printf '%s\n' 
+'# Rewritten by scripts/switch-traffic.sh and loaded by nginx.' 
+"# ACTIVE_COLOR=${NEW_COLOR}" 
+'' 
+'upstream orders_active {' 
+"    server ${NEW_CONTAINER}:3000;" 
+'}' 
+'' 
+'server {' 
+'    listen 8080;' 
+'' 
+'    location /router-status {' 
+'        default_type text/plain;' 
+"        return 200 "active-color: ${NEW_COLOR}\n";" 
+'    }' 
+'' 
+'    location / {' 
+'        proxy_pass http://orders_active;' 
+'        proxy_set_header Host $host;' 
+'        proxy_set_header X-Real-IP $remote_addr;' 
+'        proxy_connect_timeout 2s;' 
+'        proxy_read_timeout 5s;' 
+'    }' 
+'}' 
+> "$ROUTER_TMP"
 
 if [ ! -s "$ROUTER_TMP" ]; then
-fail "failed to generate temporary router configuration"
+fail "failed to generate router configuration"
 fi
 
 log "Generated router configuration:"
 cat "$ROUTER_TMP"
 
-log "Copying active backend configuration into orders-router"
+log "Installing active backend configuration into ${ROUTER_CONTAINER}"
 
-docker cp 
-"$ROUTER_TMP" 
-"${ROUTER_CONTAINER}:/etc/nginx/conf.d/active-backend.conf"
+# Avoid docker cp because Git Bash on Windows can rewrite paths.
+
+# Send the file directly into the running nginx container.
+
+docker exec -i "$ROUTER_CONTAINER" 
+sh -c 'cat > /etc/nginx/conf.d/active-backend.conf' 
+< "$ROUTER_TMP"
+
+ok "active backend configuration installed"
+
+log "Validating nginx configuration"
 
 docker exec "$ROUTER_CONTAINER" nginx -t
+
+log "Reloading nginx"
 
 docker exec "$ROUTER_CONTAINER" nginx -s reload
 
@@ -131,7 +116,7 @@ ROUTER_VERSION_JSON="$(curl -sf "http://localhost:8080/version")"
 || fail "router did not respond on 8080 after switch - production is degraded"
 
 GOT_VERSION="$(
-echo "$ROUTER_VERSION_JSON" |
+printf '%s\n' "$ROUTER_VERSION_JSON" |
 grep -o '"version": *"[^"]*"' |
 sed -E 's/.*"([^"]+)"$/\1/'
 )"
