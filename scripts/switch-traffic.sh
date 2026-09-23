@@ -32,14 +32,6 @@ source "$DIR/lib/common.sh"
 NEW_COLOR="${1:?usage: switch-traffic.sh <new_color> <expected_version>}"
 EXPECTED_VERSION="${2:?}"
 
-NEW_PORT="$(color_port "$NEW_COLOR")"
-NEW_CONTAINER="orders-${NEW_COLOR}"
-
-log "==== TRAFFIC SWITCH ===="
-log "Routing production traffic (host port 8080) to: ${NEW_COLOR} (${NEW_CONTAINER}:3000)"
-log "Candidate port: ${NEW_PORT}"
-log "========================="
-
 case "$NEW_COLOR" in
 blue|green)
 ;;
@@ -47,6 +39,14 @@ blue|green)
 fail "invalid color '${NEW_COLOR}' - expected blue or green"
 ;;
 esac
+
+NEW_PORT="$(color_port "$NEW_COLOR")"
+NEW_CONTAINER="orders-${NEW_COLOR}"
+
+log "==== TRAFFIC SWITCH ===="
+log "Routing production traffic (host port 8080) to: ${NEW_COLOR} (${NEW_CONTAINER}:3000)"
+log "Candidate port: ${NEW_PORT}"
+log "========================="
 
 if ! docker inspect "$NEW_CONTAINER" >/dev/null 2>&1; then
 fail "candidate container '${NEW_CONTAINER}' does not exist"
@@ -79,8 +79,8 @@ listen 8080;
 
 ```
 location /router-status {
+    default_type text/plain;
     return 200 "active-color: ${NEW_COLOR}\n";
-    add_header Content-Type text/plain;
 }
 
 location / {
@@ -95,7 +95,14 @@ location / {
 }
 EOF
 
-log "Copying active backend configuration into ${ROUTER_CONTAINER}"
+if [ ! -s "$ROUTER_TMP" ]; then
+fail "failed to generate temporary router configuration"
+fi
+
+log "Generated router configuration:"
+cat "$ROUTER_TMP"
+
+log "Copying active backend configuration into orders-router"
 
 docker cp 
 "$ROUTER_TMP" 
