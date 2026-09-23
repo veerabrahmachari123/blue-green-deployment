@@ -3,35 +3,43 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$DIR/lib/common.sh"
 
-NEW_COLOR="${1:?usage: switch-traffic.sh <new_color> <expected_version>}"
-EXPECTED_VERSION="${2:?usage: switch-traffic.sh <new_color> <expected_version>}"
+# Load shared deployment configuration/functions.
+
+source "$DIR/common.sh"
+
+ROUTER_CONTAINER="${ROUTER_CONTAINER:-orders-router}"
+
+NEW_COLOR="${1:-}"
+VERSION="${2:-}"
+
+if [[ -z "$NEW_COLOR" || -z "$VERSION" ]]; then
+echo "Usage: $0 <blue|green> <version>"
+exit 1
+fi
 
 case "$NEW_COLOR" in
-blue|green)
+blue)
+NEW_CONTAINER="orders-blue"
+CANDIDATE_PORT="8081"
+;;
+green)
+NEW_CONTAINER="orders-green"
+CANDIDATE_PORT="8082"
 ;;
 *)
-fail "invalid color '${NEW_COLOR}' - expected blue or green"
+echo "FAIL - invalid color: $NEW_COLOR"
+echo "Usage: $0 <blue|green> <version>"
+exit 1
 ;;
 esac
 
-NEW_PORT="$(color_port "$NEW_COLOR")"
-NEW_CONTAINER="orders-${NEW_COLOR}"
-
 log "==== TRAFFIC SWITCH ===="
-log "Routing production traffic (host port 8080) to: ${NEW_COLOR} (${NEW_CONTAINER}:3000)"
-log "Candidate port: ${NEW_PORT}"
+log "Routing production traffic (host port 8080) to: $NEW_COLOR ($NEW_CONTAINER:3000)"
+log "Candidate port: $CANDIDATE_PORT"
 log "========================="
 
-if ! docker inspect "$NEW_CONTAINER" >/dev/null 2>&1; then
-fail "candidate container '${NEW_CONTAINER}' does not exist"
-fi
-
-if ! docker inspect -f '{{.State.Running}}' "$NEW_CONTAINER" 2>/dev/null | grep -q '^true$'; then
-fail "candidate container '${NEW_CONTAINER}' is not running"
-fi
-
+TEMPLATE="$DIR/../router/active-backend.template.conf"
 ROUTER_TMP="$(mktemp)"
 
 cleanup() {
@@ -40,109 +48,91 @@ rm -f "$ROUTER_TMP"
 
 trap cleanup EXIT
 
-# Create the nginx configuration.
-
-#
-
-# IMPORTANT:
-
-# We intentionally use a quoted heredoc delimiter so that
-
-# Git Bash does NOT interpret nginx's $host and $remote_addr.
-
-#
-
-# The color/container are replaced afterward.
-
-cat > "$ROUTER_TMP" <<'NGINX_CONFIG'
-
-# Rewritten by scripts/switch-traffic.sh and loaded by nginx.
-
-# ACTIVE_COLOR=**ACTIVE_COLOR**
-
-upstream orders_active {
-server **ACTIVE_CONTAINER**:3000;
-}
-
-server {
-listen 8080;
-
-```
-location /router-status {
-    default_type text/plain;
-    return 200 "active-color: __ACTIVE_COLOR__\n";
-}
-
-location / {
-    proxy_pass http://orders_active;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_connect_timeout 2s;
-    proxy_read_timeout 5s;
-}
-```
-
-}
-NGINX_CONFIG
-
-# Replace only our placeholders.
-
-sed -i 
--e "s/**ACTIVE_COLOR**/${NEW_COLOR}/g" 
--e "s/**ACTIVE_CONTAINER**/${NEW_CONTAINER}/g" 
-"$ROUTER_TMP"
-
-if [ ! -s "$ROUTER_TMP" ]; then
-fail "failed to generate router configuration"
+if [[ ! -f "$TEMPLATE" ]]; then
+log "FAIL - router template not found: $TEMPLATE"
+exit 1
 fi
 
-log "Generated router configuration:"
-cat "$ROUTER_TMP"
+if ! docker inspect "$ROUTER_CONTAINER" >/dev/null 2>&1; then
+log "FAIL - router container '$ROUTER_CONTAINER' does not exist"
+exit 1
+fi
 
-log "Installing active backend configuration into ${ROUTER_CONTAINER}"
+if ! docker inspect "$NEW_CONTAINER" >/dev/null 2>&1; then
+log "FAIL - target container '$NEW_CONTAINER' does not exist"
+exit 1
+fi
+
+log "Generating nginx configuration..."
+
+python - "$TEMPLATE" "$ROUTER_TMP" "$NEW_COLOR" "$NEW_CONTAINER" <<'PY'
+import sys
+from pathlib import Path
+
+template_path = Path(sys.argv[1])
+output_path = Path(sys.argv[2])
+color = sys.argv[3]
+container = sys.argv[4]
+
+content = template_path.read_text(encoding="utf-8")
+
+content = content.replace("**ACTIVE_COLOR**", color)
+content = content.replace("**ACTIVE_CONTAINER**", container)
+
+output_path.write_text(content, encoding="utf-8")
+PY
+
+if [[ ! -s "$ROUTER_TMP" ]]; then
+log "FAIL - generated nginx configuration is empty"
+exit 1
+fi
+
+log "Copying generated configuration into router container..."
 
 docker exec -i "$ROUTER_CONTAINER" 
 sh -c 'cat > /etc/nginx/conf.d/active-backend.conf' 
 < "$ROUTER_TMP"
 
-ok "active backend configuration installed"
-
-log "Validating nginx configuration"
+log "Testing nginx configuration..."
 
 docker exec "$ROUTER_CONTAINER" nginx -t
 
-log "Reloading nginx"
+log "Reloading nginx..."
 
 docker exec "$ROUTER_CONTAINER" nginx -s reload
 
-ok "router reloaded, pointing at $NEW_COLOR"
+sleep 2
 
-sleep 1
+log "Verifying router status..."
 
-ROUTER_STATUS="$(curl -sf "http://localhost:8080/router-status")" 
-|| fail "router did not respond on /router-status after switch"
+ROUTER_STATUS="$(curl -fsS http://localhost:8080/router-status)"
 
-EXPECTED_STATUS="active-color: ${NEW_COLOR}"
+echo "$ROUTER_STATUS"
 
-if [ "$ROUTER_STATUS" != "$EXPECTED_STATUS" ]; then
-fail "router reports '${ROUTER_STATUS}', expected '${EXPECTED_STATUS}'"
+if [[ "$ROUTER_STATUS" != "active-color: $NEW_COLOR" ]]; then
+log "FAIL - router active color is not '$NEW_COLOR'"
+log "Actual response: $ROUTER_STATUS"
+exit 1
 fi
 
-ok "router active color confirmed: $NEW_COLOR"
+log "Verifying production version..."
 
-ROUTER_VERSION_JSON="$(curl -sf "http://localhost:8080/version")" 
-|| fail "router did not respond on 8080 after switch - production is degraded"
+VERSION_RESPONSE="$(curl -fsS http://localhost:8080/version)"
 
-GOT_VERSION="$(
-printf '%s\n' "$ROUTER_VERSION_JSON" |
-grep -o '"version": *"[^"]*"' |
-sed -E 's/.*"([^"]+)"$/\1/'
-)"
+echo "$VERSION_RESPONSE"
 
-if [ "$GOT_VERSION" != "$EXPECTED_VERSION" ]; then
-fail "router is serving version '$GOT_VERSION' through port 8080, expected '$EXPECTED_VERSION'"
+if ! echo "$VERSION_RESPONSE" | grep -q ""version": "$VERSION""; then
+log "FAIL - router is serving an unexpected version"
+exit 1
 fi
 
-ok "verified: production traffic on port 8080 is now served by $NEW_COLOR, version $GOT_VERSION"
+if ! echo "$VERSION_RESPONSE" | grep -q ""color": "$NEW_COLOR""; then
+log "FAIL - router is serving an unexpected color"
+exit 1
+fi
 
-log "==== TRAFFIC SWITCH COMPLETE ===="
+log "PASS - production traffic switched successfully"
+log "Active color: $NEW_COLOR"
+log "Version: $VERSION"
+log "Router: http://localhost:8080"
+log "========================="
