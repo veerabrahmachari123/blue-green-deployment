@@ -1,39 +1,177 @@
 #!/usr/bin/env bash
-# Called from the Jenkinsfile's post{failure{}} / catch block whenever any
-# validation stage fails BEFORE traffic switch. Implements Phase 6:
-# candidate is removed, current production color is left completely alone
-# and re-verified as still serving traffic.
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$DIR/lib/common.sh"
 
-CANDIDATE_COLOR="${1:?usage: rollback-candidate.sh <candidate_color> <current_color>}"
-CURRENT_COLOR="${2:?}"
+set -euo pipefail
+
+CANDIDATE_COLOR="${1:-}"
+CURRENT_COLOR="${2:-}"
+
+ROUTER_CONTAINER="orders-router"
+ROUTER_PORT="8080"
+
+if [[ -z "$CANDIDATE_COLOR" || -z "$CURRENT_COLOR" ]]; then
+    echo "Usage: $0 <candidate_color> <current_color>"
+    exit 1
+fi
+
+if [[ "$CANDIDATE_COLOR" != "blue" && "$CANDIDATE_COLOR" != "green" ]]; then
+    echo "FAIL - invalid candidate color: $CANDIDATE_COLOR"
+    exit 1
+fi
+
+if [[ "$CURRENT_COLOR" != "blue" && "$CURRENT_COLOR" != "green" ]]; then
+    echo "FAIL - invalid current color: $CURRENT_COLOR"
+    exit 1
+fi
+
 CANDIDATE_NAME="orders-${CANDIDATE_COLOR}"
 
-log "==== ROLLBACK (candidate validation failed) ===="
-log "Removing failed candidate: $CANDIDATE_NAME"
-log "Production must remain on: $CURRENT_COLOR"
-log "=================================================="
+echo "=================================================="
+echo "ROLLBACK - candidate validation failed"
+echo "=================================================="
+echo "Candidate : $CANDIDATE_NAME"
+echo "Production: $CURRENT_COLOR"
+echo "Router    : $ROUTER_CONTAINER"
+echo "Port      : $ROUTER_PORT"
+echo "=================================================="
 
-if container_exists "$CANDIDATE_NAME"; then
-  log "---- capturing candidate logs before removal ----"
-  docker logs --tail 100 "$CANDIDATE_NAME" 2>&1 | redact_env || true
-  log "--------------------------------------------------"
-  docker rm -f "$CANDIDATE_NAME" >/dev/null || true
-  ok "removed failed candidate '$CANDIDATE_NAME'"
+# --------------------------------------------------
+# Remove failed candidate
+# --------------------------------------------------
+
+if docker inspect "$CANDIDATE_NAME" > /dev/null 2>&1; then
+
+    echo "---- capturing candidate logs before removal ----"
+
+    docker logs --tail 100 "$CANDIDATE_NAME" \
+        > /tmp/orders-candidate-rollback.log 2>&1 || true
+
+    cat /tmp/orders-candidate-rollback.log || true
+
+    rm -f /tmp/orders-candidate-rollback.log || true
+
+    echo "--------------------------------------------------"
+
+    docker rm -f "$CANDIDATE_NAME" > /dev/null 2>&1 || true
+
+    echo "PASS - removed failed candidate '$CANDIDATE_NAME'"
+
 else
-  log "candidate container '$CANDIDATE_NAME' does not exist (failed before start) - nothing to remove"
+
+    echo "Candidate '$CANDIDATE_NAME' does not exist."
+    echo "Nothing to remove."
+
 fi
 
-# Prove production was never disturbed: router must still report the
-# original current color and respond 200 through port 8080.
-ACTUAL_ACTIVE=$(current_active_color)
-if [ "$ACTUAL_ACTIVE" != "$CURRENT_COLOR" ]; then
-  fail "UNEXPECTED: router active color is '$ACTUAL_ACTIVE', expected untouched '$CURRENT_COLOR' - manual investigation required"
+# --------------------------------------------------
+# Verify router exists
+# --------------------------------------------------
+
+if ! docker inspect "$ROUTER_CONTAINER" > /dev/null 2>&1; then
+    echo "FAIL - router container '$ROUTER_CONTAINER' does not exist"
+    exit 1
 fi
 
-if curl -sf -o /dev/null "http://localhost:8080/health"; then
-  ok "confirmed: production is still being served by '$CURRENT_COLOR' on port 8080"
+echo "PASS - router container exists"
+
+# --------------------------------------------------
+# Read actual active configuration INSIDE router
+# --------------------------------------------------
+
+echo "Checking active router configuration..."
+
+MSYS_NO_PATHCONV=1 docker exec \
+    "$ROUTER_CONTAINER" \
+    cat /etc/nginx/conf.d/active-backend.conf \
+    > /tmp/orders-active-backend.conf
+
+if [[ ! -s /tmp/orders-active-backend.conf ]]; then
+    echo "FAIL - could not read active router configuration"
+    rm -f /tmp/orders-active-backend.conf
+    exit 1
+fi
+
+cat /tmp/orders-active-backend.conf
+
+ACTIVE_COLOR=$(
+    grep 'ACTIVE_COLOR=' /tmp/orders-active-backend.conf |
+    head -n 1 |
+    cut -d '=' -f 2 |
+    tr -d '[:space:]#'
+)
+
+rm -f /tmp/orders-active-backend.conf
+
+echo "Detected active color: $ACTIVE_COLOR"
+
+if [[ "$ACTIVE_COLOR" != "$CURRENT_COLOR" ]]; then
+    echo "FAIL - UNEXPECTED: router active color is '$ACTIVE_COLOR'"
+    echo "Expected untouched production color: '$CURRENT_COLOR'"
+    echo "Manual investigation required."
+    exit 1
+fi
+
+echo "PASS - router configuration still points to '$CURRENT_COLOR'"
+
+# --------------------------------------------------
+# Verify router status endpoint
+# --------------------------------------------------
+
+echo "Checking router status endpoint..."
+
+ROUTER_STATUS=$(curl -fsS "http://localhost:${ROUTER_PORT}/router-status")
+
+echo "$ROUTER_STATUS"
+
+EXPECTED_STATUS="active-color: ${CURRENT_COLOR}"
+
+if [[ "$ROUTER_STATUS" != "$EXPECTED_STATUS" ]]; then
+    echo "FAIL - router status is '$ROUTER_STATUS'"
+    echo "Expected: '$EXPECTED_STATUS'"
+    exit 1
+fi
+
+echo "PASS - router status reports '$CURRENT_COLOR'"
+
+# --------------------------------------------------
+# Verify production health
+# --------------------------------------------------
+
+echo "Checking production health..."
+
+if curl -fsS -o /dev/null "http://localhost:${ROUTER_PORT}/health"; then
+    echo "PASS - production is responding on port ${ROUTER_PORT}"
 else
-  fail "CRITICAL: production ('$CURRENT_COLOR') is not responding on port 8080 after rollback - escalate immediately"
+    echo "FAIL - production is NOT responding on port ${ROUTER_PORT}"
+    exit 1
 fi
+
+# --------------------------------------------------
+# Verify production identity
+# --------------------------------------------------
+
+echo "Checking production identity..."
+
+VERSION_RESPONSE=$(curl -fsS "http://localhost:${ROUTER_PORT}/version")
+
+echo "$VERSION_RESPONSE"
+
+if ! echo "$VERSION_RESPONSE" | grep -q "\"color\": \"$CURRENT_COLOR\""; then
+    echo "FAIL - production does not report color '$CURRENT_COLOR'"
+    exit 1
+fi
+
+echo "PASS - production identity reports '$CURRENT_COLOR'"
+
+# --------------------------------------------------
+# Complete
+# --------------------------------------------------
+
+echo "=================================================="
+echo "ROLLBACK COMPLETE"
+echo "=================================================="
+echo "Candidate removed : $CANDIDATE_NAME"
+echo "Production color   : $CURRENT_COLOR"
+echo "Production port    : $ROUTER_PORT"
+echo "Production health  : OK"
+echo "=================================================="
+

@@ -4,64 +4,76 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Load shared deployment configuration/functions.
-
-source "$DIR/common.sh"
-
-ROUTER_CONTAINER="${ROUTER_CONTAINER:-orders-router}"
+ROUTER_CONTAINER="orders-router"
+ROUTER_PORT="8080"
 
 NEW_COLOR="${1:-}"
 VERSION="${2:-}"
 
+log() {
+    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*"
+}
+
 if [[ -z "$NEW_COLOR" || -z "$VERSION" ]]; then
-echo "Usage: $0 <blue|green> <version>"
-exit 1
+    echo "Usage: $0 <blue|green> <version>"
+    exit 1
 fi
 
 case "$NEW_COLOR" in
-blue)
-NEW_CONTAINER="orders-blue"
-CANDIDATE_PORT="8081"
-;;
-green)
-NEW_CONTAINER="orders-green"
-CANDIDATE_PORT="8082"
-;;
-*)
-echo "FAIL - invalid color: $NEW_COLOR"
-echo "Usage: $0 <blue|green> <version>"
-exit 1
-;;
+    blue)
+        NEW_CONTAINER="orders-blue"
+        CANDIDATE_PORT="8081"
+        ;;
+    green)
+        NEW_CONTAINER="orders-green"
+        CANDIDATE_PORT="8082"
+        ;;
+    *)
+        log "FAIL - invalid color: $NEW_COLOR"
+        exit 1
+        ;;
 esac
 
 log "==== TRAFFIC SWITCH ===="
-log "Routing production traffic (host port 8080) to: $NEW_COLOR ($NEW_CONTAINER:3000)"
-log "Candidate port: $CANDIDATE_PORT"
+log "Target color    : $NEW_COLOR"
+log "Target container: $NEW_CONTAINER"
+log "Target version  : $VERSION"
+log "Router          : $ROUTER_CONTAINER"
+log "Production port : $ROUTER_PORT"
+log "Candidate port  : $CANDIDATE_PORT"
 log "========================="
 
 TEMPLATE="$DIR/../router/active-backend.template.conf"
 ROUTER_TMP="$(mktemp)"
 
 cleanup() {
-rm -f "$ROUTER_TMP"
+    rm -f "$ROUTER_TMP"
 }
 
 trap cleanup EXIT
 
+# ------------------------------------------------------------
+# Validate prerequisites
+# ------------------------------------------------------------
+
 if [[ ! -f "$TEMPLATE" ]]; then
-log "FAIL - router template not found: $TEMPLATE"
-exit 1
+    log "FAIL - router template not found: $TEMPLATE"
+    exit 1
 fi
 
 if ! docker inspect "$ROUTER_CONTAINER" >/dev/null 2>&1; then
-log "FAIL - router container '$ROUTER_CONTAINER' does not exist"
-exit 1
+    log "FAIL - router container '$ROUTER_CONTAINER' does not exist"
+    exit 1
 fi
 
 if ! docker inspect "$NEW_CONTAINER" >/dev/null 2>&1; then
-log "FAIL - target container '$NEW_CONTAINER' does not exist"
-exit 1
+    log "FAIL - target container '$NEW_CONTAINER' does not exist"
+    exit 1
 fi
+
+# ------------------------------------------------------------
+# Generate nginx configuration
+# ------------------------------------------------------------
 
 log "Generating nginx configuration..."
 
@@ -76,63 +88,101 @@ container = sys.argv[4]
 
 content = template_path.read_text(encoding="utf-8")
 
-content = content.replace("**ACTIVE_COLOR**", color)
-content = content.replace("**ACTIVE_CONTAINER**", container)
+content = content.replace("__ACTIVE_COLOR__", color)
+content = content.replace("__ACTIVE_CONTAINER__", container)
 
 output_path.write_text(content, encoding="utf-8")
 PY
 
 if [[ ! -s "$ROUTER_TMP" ]]; then
-log "FAIL - generated nginx configuration is empty"
-exit 1
+    log "FAIL - generated nginx configuration is empty"
+    exit 1
 fi
 
-log "Copying generated configuration into router container..."
+log "Generated nginx configuration:"
+cat "$ROUTER_TMP"
 
-docker exec -i "$ROUTER_CONTAINER" 
-sh -c 'cat > /etc/nginx/conf.d/active-backend.conf' 
-< "$ROUTER_TMP"
+# ------------------------------------------------------------
+# Update actual running router container
+# ------------------------------------------------------------
+
+log "Updating configuration inside '$ROUTER_CONTAINER'..."
+
+MSYS_NO_PATHCONV=1 docker exec -i "$ROUTER_CONTAINER" \
+    sh -c 'cat > /etc/nginx/conf.d/active-backend.conf' \
+    < "$ROUTER_TMP"
+
+# ------------------------------------------------------------
+# Validate nginx
+# ------------------------------------------------------------
 
 log "Testing nginx configuration..."
 
-docker exec "$ROUTER_CONTAINER" nginx -t
+MSYS_NO_PATHCONV=1 docker exec "$ROUTER_CONTAINER" nginx -t
+
+# ------------------------------------------------------------
+# Reload nginx
+# ------------------------------------------------------------
 
 log "Reloading nginx..."
 
-docker exec "$ROUTER_CONTAINER" nginx -s reload
+MSYS_NO_PATHCONV=1 docker exec "$ROUTER_CONTAINER" nginx -s reload
 
 sleep 2
 
+# ------------------------------------------------------------
+# Verify router status
+# ------------------------------------------------------------
+
 log "Verifying router status..."
 
-ROUTER_STATUS="$(curl -fsS http://localhost:8080/router-status)"
+ROUTER_STATUS="$(curl -fsS "http://localhost:${ROUTER_PORT}/router-status")"
 
 echo "$ROUTER_STATUS"
 
-if [[ "$ROUTER_STATUS" != "active-color: $NEW_COLOR" ]]; then
-log "FAIL - router active color is not '$NEW_COLOR'"
-log "Actual response: $ROUTER_STATUS"
-exit 1
+EXPECTED_STATUS="active-color: ${NEW_COLOR}"
+
+if [[ "$ROUTER_STATUS" != "$EXPECTED_STATUS" ]]; then
+    log "FAIL - router active color is '$ROUTER_STATUS'"
+    log "Expected: '$EXPECTED_STATUS'"
+    exit 1
 fi
 
-log "Verifying production version..."
+log "PASS - router reports active color '$NEW_COLOR'"
 
-VERSION_RESPONSE="$(curl -fsS http://localhost:8080/version)"
+# ------------------------------------------------------------
+# Verify application version and color
+# ------------------------------------------------------------
+
+log "Verifying production application identity..."
+
+VERSION_RESPONSE="$(curl -fsS "http://localhost:${ROUTER_PORT}/version")"
 
 echo "$VERSION_RESPONSE"
 
-if ! echo "$VERSION_RESPONSE" | grep -q ""version": "$VERSION""; then
-log "FAIL - router is serving an unexpected version"
-exit 1
+if ! echo "$VERSION_RESPONSE" | grep -q "\"version\": \"$VERSION\""; then
+    log "FAIL - router is serving unexpected version"
+    log "Expected version: $VERSION"
+    exit 1
 fi
 
-if ! echo "$VERSION_RESPONSE" | grep -q ""color": "$NEW_COLOR""; then
-log "FAIL - router is serving an unexpected color"
-exit 1
+if ! echo "$VERSION_RESPONSE" | grep -q "\"color\": \"$NEW_COLOR\""; then
+    log "FAIL - router is serving unexpected color"
+    log "Expected color: $NEW_COLOR"
+    exit 1
 fi
 
-log "PASS - production traffic switched successfully"
+log "PASS - production version is '$VERSION'"
+log "PASS - production color is '$NEW_COLOR'"
+
+# ------------------------------------------------------------
+# Success
+# ------------------------------------------------------------
+
+log "========================================="
+log "TRAFFIC SWITCH SUCCESSFUL"
+log "========================================="
 log "Active color: $NEW_COLOR"
-log "Version: $VERSION"
-log "Router: http://localhost:8080"
-log "========================="
+log "Version     : $VERSION"
+log "Router      : http://localhost:${ROUTER_PORT}"
+log "========================================="
