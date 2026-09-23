@@ -1,4 +1,3 @@
-```bash
 #!/usr/bin/env bash
 
 set -euo pipefail
@@ -524,4 +523,3 @@ log_msg "Candidate container started successfully."
 log_msg "Candidate image: ${IMAGE_TAG}"
 log_msg "Candidate color: ${CANDIDATE_COLOR}"
 log_msg "Candidate port: ${CANDIDATE_PORT}"
-```
