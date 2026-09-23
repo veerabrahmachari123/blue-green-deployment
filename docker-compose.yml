@@ -1,0 +1,57 @@
+version: "3.8"
+
+# This compose file provisions the STATIC parts of the environment:
+#   - the shared network
+#   - the database
+#   - the traffic router (nginx) that fronts host port 8080 and is
+#     switched between orders-blue and orders-green by the deploy scripts.
+#
+# The orders-blue / orders-green APPLICATION containers are intentionally
+# NOT defined here. They are started/stopped by scripts/*.sh (invoked from
+# the Jenkinsfile) using `docker run`, because blue-green needs to bring up
+# one color while the other is already live under compose's management —
+# something `docker compose up` alone does not model well.
+#
+# Bring the static layer up with:  docker compose up -d
+# Then run a deployment with:      ./scripts/deploy-blue-green.sh <version>
+
+networks:
+  orders-network:
+    name: orders-network
+    driver: bridge
+
+volumes:
+  orders-db-data:
+
+services:
+  orders-db:
+    image: postgres:16-alpine
+    container_name: orders-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: ${ORDERS_DB_PASSWORD:-orders_dev_password}
+    volumes:
+      - orders-db-data:/var/lib/postgresql/data
+    networks:
+      - orders-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders -d orders"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  orders-router:
+    image: nginx:1.27-alpine
+    container_name: orders-router
+    restart: unless-stopped
+    ports:
+      - "8099:8080"
+    volumes:
+      - ./router/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./router/active-backend.conf:/etc/nginx/conf.d/active-backend.conf:ro
+    networks:
+      - orders-network
+    depends_on:
+      - orders-db

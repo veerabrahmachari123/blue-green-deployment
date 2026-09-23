@@ -1,0 +1,9 @@
+# Never commit real secrets
+scripts/secrets/orders-api.env
+*.env
+!scripts/secrets/orders-api.env.example
+
+# Local/runtime noise
+node_modules/
+*.log
+.evidence/*.raw

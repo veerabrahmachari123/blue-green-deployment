@@ -1,0 +1,11 @@
+{
+  "name": "orders-api",
+  "version": "0.0.0-set-at-build-time",
+  "description": "orders-api sample service used for the Jenkins/Docker blue-green training exercise",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "license": "MIT"
+}
