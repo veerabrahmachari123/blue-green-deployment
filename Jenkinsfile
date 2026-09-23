@@ -1,12 +1,4 @@
-// orders-api blue-green deployment pipeline
-//
-// A green build here means: a new immutably-tagged image was built from a
-// known Git commit, started alongside the currently-live color, proven
-// healthy AND functionally correct (DB reachable, identity verified), and
-// ONLY THEN promoted by switching router traffic.
-//
-// Any failure before promotion leaves production untouched.
-
+```groovy
 pipeline {
 
     agent any
@@ -25,24 +17,15 @@ pipeline {
         ROUTER_CONTAINER = 'orders-router'
         DB_CONTAINER = 'orders-db'
 
-        // IMPORTANT:
-        // Do NOT set MSYS_NO_PATHCONV globally.
-        //
-        // Docker commands that use Linux/container paths such as:
-        //     -w /app
-        //
-        // need MSYS_NO_PATHCONV=1.
-        //
-        // But docker build on Windows needs Git Bash to convert:
-        //     /c/ProgramData/...
-        //
-        // into:
-        //     C:/ProgramData/...
-        //
-        // Therefore MSYS_NO_PATHCONV is enabled only on the
-        // docker run command in the Unit/Application Test stage.
-
-        SECRET_ENV_FILE = "${WORKSPACE}/scripts/secrets/orders-api.env"
+        /*
+         * DO NOT set MSYS_NO_PATHCONV globally.
+         *
+         * Windows Jenkins + Git Bash needs normal path conversion for
+         * docker build.
+         *
+         * Enable MSYS_NO_PATHCONV=1 only around docker run commands
+         * that contain Linux container paths such as /app.
+         */
     }
 
     options {
@@ -56,6 +39,12 @@ pipeline {
     }
 
     stages {
+
+        /*
+         * ================================================================
+         * CHECKOUT
+         * ================================================================
+         */
 
         stage('Checkout') {
             steps {
@@ -79,13 +68,21 @@ pipeline {
             }
         }
 
+
+        /*
+         * ================================================================
+         * VALIDATE VERSION
+         * ================================================================
+         */
+
         stage('Validate Version') {
             steps {
 
                 script {
+
                     if (!params.APP_VERSION?.trim()) {
                         error(
-                            "APP_VERSION parameter is required, e.g. APP_VERSION=7.9"
+                            'APP_VERSION parameter is required, e.g. APP_VERSION=7.9'
                         )
                     }
                 }
@@ -101,6 +98,13 @@ pipeline {
                 """
             }
         }
+
+
+        /*
+         * ================================================================
+         * UNIT / APPLICATION TEST
+         * ================================================================
+         */
 
         stage('Unit/Application Test') {
             steps {
@@ -128,16 +132,19 @@ pipeline {
 
                     echo "Running Node.js tests inside node:20-alpine..."
 
-                    # IMPORTANT:
-                    # This flag is scoped ONLY to docker run.
-                    #
-                    # The Jenkins agent uses Windows + Git Bash.
-                    # Git Bash otherwise converts /app into:
-                    #
-                    # C:/Program Files/Git/app
-                    #
-                    # which causes Docker to reject the container
-                    # working directory.
+                    /*
+                     * Windows Jenkins uses Git Bash.
+                     *
+                     * Without MSYS_NO_PATHCONV=1 Git Bash can transform:
+                     *
+                     *     /app
+                     *
+                     * into:
+                     *
+                     *     C:/Program Files/Git/app
+                     *
+                     * which breaks Docker's container working directory.
+                     */
 
                     MSYS_NO_PATHCONV=1 docker run --rm \
                         -v "${WORKSPACE}/app:/app" \
@@ -152,21 +159,22 @@ pipeline {
             }
         }
 
+
+        /*
+         * ================================================================
+         * DOCKER BUILD
+         * ================================================================
+         */
+
         stage('Docker Build') {
             steps {
 
                 script {
 
-                    // IMPORTANT:
-                    // Do NOT pipe the build script through `tail`.
-                    //
-                    // A pipe can hide the exit code from docker build.
-                    // build-image.sh now fails immediately when Docker
-                    // fails and returns the immutable image tag on its
-                    // final line.
-
                     def buildOutput = sh(
                         script: """
+                            set -e
+
                             scripts/build-image.sh \
                                 '${params.APP_VERSION}' \
                                 '${env.GIT_COMMIT_SHA}'
@@ -174,22 +182,42 @@ pipeline {
                         returnStdout: true
                     ).trim()
 
-                    def outputLines = buildOutput.readLines()
-
-                    if (outputLines.isEmpty()) {
-                        error("Docker build script returned no output.")
+                    if (!buildOutput) {
+                        error('Docker build script returned no output.')
                     }
 
-                    env.IMAGE_TAG = outputLines[-1].trim()
+                    def lines = buildOutput.readLines()
+
+                    /*
+                     * build-image.sh must print the final image tag
+                     * as its LAST line.
+                     */
+                    env.IMAGE_TAG = lines[-1].trim()
 
                     if (!env.IMAGE_TAG) {
-                        error("Docker build did not return an image tag.")
+                        error('Docker build did not return an image tag.')
+                    }
+
+                    /*
+                     * Basic image-tag sanity check.
+                     */
+                    if (!env.IMAGE_TAG.startsWith("${env.IMAGE_NAME}:")) {
+                        error(
+                            "Invalid image tag returned by build-image.sh: ${env.IMAGE_TAG}"
+                        )
                     }
 
                     echo "Built image: ${env.IMAGE_TAG}"
                 }
             }
         }
+
+
+        /*
+         * ================================================================
+         * DOCKER IMAGE VALIDATION
+         * ================================================================
+         */
 
         stage('Docker Image Validation') {
             steps {
@@ -203,35 +231,172 @@ pipeline {
             }
         }
 
+
+        /*
+         * ================================================================
+         * START CANDIDATE
+         * ================================================================
+         */
+
         stage('Start Candidate') {
             steps {
 
-                script {
+                /*
+                 * Jenkins credential setup:
+                 *
+                 * Create:
+                 *
+                 *   Kind: Secret text
+                 *   ID: orders-api-secret
+                 *
+                 * The value should be the actual value of
+                 * ORDERS_API_SECRET.
+                 *
+                 * Jenkins injects the secret into:
+                 *
+                 *   ORDERS_API_SECRET_VALUE
+                 *
+                 * We create the temporary env file expected by
+                 * start-candidate.sh.
+                 *
+                 * The file is deleted in the finally block.
+                 */
 
-                    def out = sh(
-                        script: """
-                            scripts/start-candidate.sh \
-                                '${env.IMAGE_TAG}' \
-                                '${params.APP_VERSION}' \
-                                '${env.GIT_COMMIT_SHA}'
-                        """,
-                        returnStdout: true
-                    ).trim()
+                withCredentials([
+                    string(
+                        credentialsId: 'orders-api-secret',
+                        variable: 'ORDERS_API_SECRET_VALUE'
+                    )
+                ]) {
 
-                    echo out
+                    script {
 
-                    out.split('\\n').each { line ->
+                        def secretDir =
+                            "${env.WORKSPACE}/scripts/secrets"
 
-                        if (line.contains('=')) {
+                        def secretFile =
+                            "${secretDir}/orders-api.env"
 
-                            def parts = line.split('=', 2)
+                        try {
 
-                            if (parts.length == 2) {
-                                def key = parts[0].trim()
-                                def value = parts[1].trim()
+                            /*
+                             * IMPORTANT:
+                             *
+                             * Do not interpolate the secret into a
+                             * Groovy triple-quoted string.
+                             *
+                             * Let the shell expand the Jenkins-provided
+                             * environment variable.
+                             */
 
-                                env."${key}" = value
+                            sh '''
+                                set -e
+
+                                mkdir -p "$WORKSPACE/scripts/secrets"
+
+                                printf '%s\\n' \
+                                    "ORDERS_API_SECRET=$ORDERS_API_SECRET_VALUE" \
+                                    > "$WORKSPACE/scripts/secrets/orders-api.env"
+
+                                chmod 600 \
+                                    "$WORKSPACE/scripts/secrets/orders-api.env"
+
+                                echo "Temporary deployment secret file created."
+                            '''
+
+                            def out = sh(
+                                script: """
+                                    set -e
+
+                                    scripts/start-candidate.sh \
+                                        '${env.IMAGE_TAG}' \
+                                        '${params.APP_VERSION}' \
+                                        '${env.GIT_COMMIT_SHA}'
+                                """,
+                                returnStdout: true
+                            ).trim()
+
+                            if (!out) {
+                                error(
+                                    'start-candidate.sh returned no output.'
+                                )
                             }
+
+                            echo out
+
+                            /*
+                             * Parse deployment metadata returned by
+                             * start-candidate.sh.
+                             *
+                             * Never copy ORDERS_API_SECRET into Jenkins
+                             * environment variables.
+                             */
+
+                            out.split('\\n').each { line ->
+
+                                if (line.contains('=')) {
+
+                                    def parts = line.split('=', 2)
+
+                                    if (parts.length == 2) {
+
+                                        def key =
+                                            parts[0].trim()
+
+                                        def value =
+                                            parts[1].trim()
+
+                                        if (key &&
+                                            key != 'ORDERS_API_SECRET') {
+
+                                            env."${key}" = value
+                                        }
+                                    }
+                                }
+                            }
+
+                            /*
+                             * Verify that the candidate metadata needed
+                             * by the following stages was actually returned.
+                             */
+
+                            if (!env.CURRENT_COLOR) {
+                                error(
+                                    'start-candidate.sh did not return CURRENT_COLOR.'
+                                )
+                            }
+
+                            if (!env.CANDIDATE_COLOR) {
+                                error(
+                                    'start-candidate.sh did not return CANDIDATE_COLOR.'
+                                )
+                            }
+
+                            if (!env.CANDIDATE_NAME) {
+                                error(
+                                    'start-candidate.sh did not return CANDIDATE_NAME.'
+                                )
+                            }
+
+                            if (!env.CANDIDATE_PORT) {
+                                error(
+                                    'start-candidate.sh did not return CANDIDATE_PORT.'
+                                )
+                            }
+
+                        } finally {
+
+                            /*
+                             * Always remove the temporary secret file.
+                             */
+
+                            sh '''
+                                rm -f \
+                                    "$WORKSPACE/scripts/secrets/orders-api.env" \
+                                    || true
+                            '''
+
+                            echo "Temporary deployment secret file removed."
                         }
                     }
                 }
@@ -239,6 +404,13 @@ pipeline {
                 echo "CURRENT color: ${env.CURRENT_COLOR} | CANDIDATE color: ${env.CANDIDATE_COLOR} (port ${env.CANDIDATE_PORT})"
             }
         }
+
+
+        /*
+         * ================================================================
+         * CONTAINER VALIDATION
+         * ================================================================
+         */
 
         stage('Container Validation') {
             steps {
@@ -250,6 +422,13 @@ pipeline {
                 """
             }
         }
+
+
+        /*
+         * ================================================================
+         * APPLICATION HEALTH CHECK
+         * ================================================================
+         */
 
         stage('Application Health Check') {
             steps {
@@ -264,6 +443,13 @@ pipeline {
             }
         }
 
+
+        /*
+         * ================================================================
+         * INTEGRATION CHECK
+         * ================================================================
+         */
+
         stage('Integration Check') {
             steps {
 
@@ -276,6 +462,13 @@ pipeline {
             }
         }
 
+
+        /*
+         * ================================================================
+         * TRAFFIC SWITCH
+         * ================================================================
+         */
+
         stage('Traffic Switch') {
             steps {
 
@@ -286,6 +479,13 @@ pipeline {
                 """
             }
         }
+
+
+        /*
+         * ================================================================
+         * OLD VERSION CLEANUP
+         * ================================================================
+         */
 
         stage('Old Version Cleanup') {
             steps {
@@ -300,6 +500,13 @@ pipeline {
                 '''
             }
         }
+
+
+        /*
+         * ================================================================
+         * DEPLOYMENT VERIFICATION
+         * ================================================================
+         */
 
         stage('Deployment Verification') {
             steps {
@@ -319,37 +526,63 @@ pipeline {
         }
     }
 
+
+    /*
+     * ====================================================================
+     * POST ACTIONS
+     * ====================================================================
+     */
+
     post {
 
         failure {
 
             script {
 
-                echo "Build FAILED before/at stage '${env.STAGE_NAME}'. Rolling back candidate, leaving production untouched."
+                echo "Build FAILED. Production traffic was not intentionally switched."
 
-                if (env.CANDIDATE_COLOR && env.CURRENT_COLOR) {
+                /*
+                 * If candidate metadata is available, remove/rollback
+                 * the candidate without touching production traffic.
+                 */
+
+                if (env.CANDIDATE_COLOR &&
+                    env.CURRENT_COLOR) {
 
                     sh """
                         scripts/rollback-candidate.sh \
                             '${env.CANDIDATE_COLOR}' \
-                            '${env.CURRENT_COLOR}' || true
+                            '${env.CURRENT_COLOR}' \
+                            || true
                     """
 
                 } else {
 
-                    echo "Failure occurred before a candidate color was determined - no candidate to roll back."
+                    echo "No candidate color was available for rollback."
                 }
             }
 
-            echo "Diagnostic logs and container state were captured above for this failure."
+            echo "Diagnostic logs and container state were captured above."
         }
+
 
         success {
 
-            echo "Deployment SUCCESSFUL: version=${params.APP_VERSION} commit=${env.GIT_COMMIT_SHA} now live as ${env.CANDIDATE_COLOR} on port 8080."
+            echo "========================================="
+            echo "BLUE/GREEN DEPLOYMENT SUCCESSFUL"
+            echo "========================================="
+            echo "Version        : ${params.APP_VERSION}"
+            echo "Commit         : ${env.GIT_COMMIT_SHA}"
+            echo "Active Color   : ${env.CANDIDATE_COLOR}"
+            echo "Candidate Port : ${env.CANDIDATE_PORT}"
+            echo "Production Port: 8080"
+            echo "========================================="
         }
 
+
         always {
+
+            echo "Final orders-* container state:"
 
             sh '''
                 docker ps \
@@ -360,3 +593,4 @@ pipeline {
         }
     }
 }
+```
