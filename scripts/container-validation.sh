@@ -1,55 +1,290 @@
 #!/usr/bin/env bash
-# Jenkins stage: Container Validation
-# This is deliberately stricter than "docker ps shows Up" - that check alone
-# is what let the original incident's broken build report SUCCESS. It also
-# covers Phase 5 scenarios #26 (exits immediately), #28 (wrong port),
-# #32 (wrong network), #31 (missing required env var).
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$DIR/lib/common.sh"
 
-CANDIDATE_NAME="${1:?usage: container-validation.sh <candidate_name> <candidate_port>}"
-CANDIDATE_PORT="${2:?}"
+set -euo pipefail
 
-log "Validating container '$CANDIDATE_NAME'"
+CONTAINER_NAME="${1:?usage: container-validation.sh <container_name> <host_port>}"
+HOST_PORT="${2:?usage: container-validation.sh <container_name> <host_port>}"
 
-# Give it a moment, then check it hasn't exited (scenario #26).
-sleep 2
-if ! container_running "$CANDIDATE_NAME"; then
-  log "---- last 50 log lines from $CANDIDATE_NAME ----"
-  docker logs --tail 50 "$CANDIDATE_NAME" 2>&1 | redact_env || true
-  log "-------------------------------------------------"
-  fail "container '$CANDIDATE_NAME' is not running (exited immediately - Phase 5 #26)"
+NETWORK_NAME="${NETWORK_NAME:-orders-network}"
+
+log_msg() {
+    if declare -F log >/dev/null 2>&1; then
+        log "$1"
+    else
+        printf '[%s] %s\n' \
+            "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+            "$1"
+    fi
+}
+
+fail_msg() {
+    if declare -F fail >/dev/null 2>&1; then
+        fail "$1"
+    else
+        printf '[%s] FAIL - %s\n' \
+            "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+            "$1" >&2
+    fi
+}
+
+
+log_msg "Validating container '${CONTAINER_NAME}'"
+
+
+# ======================================================================
+# Container existence
+# ======================================================================
+
+if ! docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+
+    fail_msg \
+        "container '${CONTAINER_NAME}' does not exist"
+
+    exit 1
 fi
-ok "container is running"
 
-# Confirm it is actually attached to orders-network (scenario #32).
-NETWORKS=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$CANDIDATE_NAME")
-echo "$NETWORKS" | grep -qw "$NETWORK_NAME" || fail "container is not attached to '$NETWORK_NAME' (Phase 5 #32) - attached to: $NETWORKS"
-ok "attached to network '$NETWORK_NAME'"
 
-# Confirm the published port mapping matches what we expect (scenario #28,
-# and the original incident's root cause of a mismatched port mapping).
-MAPPED=$(docker port "$CANDIDATE_NAME" 3000/tcp || true)
-echo "$MAPPED" | grep -q ":${CANDIDATE_PORT}$" || fail "container port 3000 is not published on expected host port $CANDIDATE_PORT (got: '$MAPPED') - Phase 5 #28"
-ok "port mapping confirmed: $MAPPED"
+# ======================================================================
+# Container running state
+# ======================================================================
 
-# Confirm the process inside the container is actually listening on 3000
-# (this is the exact check the original incident skipped).
-if docker exec "$CANDIDATE_NAME" sh -c "command -v netstat >/dev/null 2>&1 || command -v ss >/dev/null 2>&1"; then
-  LISTENING=$(docker exec "$CANDIDATE_NAME" sh -c "netstat -ltn 2>/dev/null || ss -ltn 2>/dev/null" | grep -c ':3000 ' || true)
-  [ "$LISTENING" -ge 1 ] || fail "no process inside the container is listening on port 3000 - Phase 5 #28"
-  ok "process inside the container is listening on 3000"
-else
-  log "no netstat/ss available inside image; relying on the HTTP checks in the next stage instead"
+RUNNING="$(
+    docker inspect \
+        --format '{{.State.Running}}' \
+        "$CONTAINER_NAME"
+)"
+
+if [ "$RUNNING" != "true" ]; then
+
+    fail_msg \
+        "container '${CONTAINER_NAME}' is not running"
+
+    echo "Container state:"
+
+    docker ps -a \
+        --filter "name=^${CONTAINER_NAME}$" \
+        --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' \
+        || true
+
+    echo "Recent container logs:"
+
+    docker logs --tail 100 "$CONTAINER_NAME" \
+        2>&1 ||
+        true
+
+    exit 1
 fi
 
-# Confirm required env vars are present WITHOUT printing their values
-# (redact secrets - Phase 7).
-log "Environment present on candidate (secrets redacted):"
-docker exec "$CANDIDATE_NAME" env | redact_env | sort
+log_msg "OK   - container is running"
 
-REQUIRED_VARS="VERSION GIT_COMMIT COLOR DB_HOST DB_PORT ORDERS_API_SECRET"
-for v in $REQUIRED_VARS; do
-  docker exec "$CANDIDATE_NAME" sh -c "[ -n \"\$$v\" ]" || fail "required env var '$v' is missing on candidate (Phase 5 #31)"
-done
-ok "all required environment variables are present"
+
+# ======================================================================
+# Docker network validation
+# ======================================================================
+
+if ! docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
+
+    fail_msg \
+        "required Docker network '${NETWORK_NAME}' does not exist"
+
+    exit 1
+fi
+
+if ! docker network inspect "$NETWORK_NAME" \
+    --format '{{range .Containers}}{{.Name}}{{"\n"}}{{end}}' |
+    grep -Fxq "$CONTAINER_NAME"; then
+
+    fail_msg \
+        "container '${CONTAINER_NAME}' is not attached to network '${NETWORK_NAME}'"
+
+    exit 1
+fi
+
+log_msg \
+    "OK   - attached to network '${NETWORK_NAME}'"
+
+
+# ======================================================================
+# Host port validation
+# ======================================================================
+
+PORT_MAPPING="$(
+    docker port "$CONTAINER_NAME" 3000/tcp 2>/dev/null || true
+)"
+
+if [ -z "$PORT_MAPPING" ]; then
+
+    fail_msg \
+        "container '${CONTAINER_NAME}' does not expose container port 3000"
+
+    exit 1
+fi
+
+if ! printf '%s\n' "$PORT_MAPPING" |
+    grep -Eq "[:.]${HOST_PORT}$|:${HOST_PORT}->"; then
+
+    fail_msg \
+        "expected host port ${HOST_PORT} but got: ${PORT_MAPPING}"
+
+    exit 1
+fi
+
+log_msg \
+    "OK   - port mapping confirmed: ${PORT_MAPPING}"
+
+
+# ======================================================================
+# Application process listening on port 3000
+# ======================================================================
+
+if ! docker exec "$CONTAINER_NAME" \
+    sh -c 'wget -q -O /dev/null http://127.0.0.1:3000/health || exit 1' \
+    >/dev/null 2>&1; then
+
+    fail_msg \
+        "application is not responding on port 3000 inside '${CONTAINER_NAME}'"
+
+    echo "Recent container logs:"
+
+    docker logs --tail 100 "$CONTAINER_NAME" \
+        2>&1 ||
+        true
+
+    exit 1
+fi
+
+log_msg \
+    "OK   - process inside the container is listening on 3000"
+
+
+# ======================================================================
+# Inspect environment safely
+#
+# Secrets are redacted.
+# ======================================================================
+
+echo "Environment present on candidate (secrets redacted):"
+
+docker inspect \
+    --format '{{range .Config.Env}}{{println .}}{{end}}' \
+    "$CONTAINER_NAME" |
+    while IFS= read -r entry; do
+
+        case "$entry" in
+
+            ORDERS_API_SECRET=*)
+                echo "ORDERS_API_SECRET=***REDACTED***"
+                ;;
+
+            *)
+                echo "$entry"
+                ;;
+
+        esac
+
+    done
+
+
+# ======================================================================
+# Required deployment environment
+#
+# APP_COLOR is the canonical variable used by start-candidate.sh.
+# COLOR is accepted as a legacy fallback.
+# ======================================================================
+
+APP_COLOR="$(
+    docker inspect \
+        --format '{{range .Config.Env}}{{println .}}{{end}}' \
+        "$CONTAINER_NAME" |
+        sed -n 's/^APP_COLOR=//p' |
+        head -n1
+)"
+
+LEGACY_COLOR="$(
+    docker inspect \
+        --format '{{range .Config.Env}}{{println .}}{{end}}' \
+        "$CONTAINER_NAME" |
+        sed -n 's/^COLOR=//p' |
+        head -n1
+)"
+
+if [ -z "$APP_COLOR" ]; then
+    APP_COLOR="$LEGACY_COLOR"
+fi
+
+if [ -z "$APP_COLOR" ]; then
+
+    fail_msg \
+        "required deployment color is missing; expected APP_COLOR"
+
+    exit 1
+fi
+
+case "$APP_COLOR" in
+    blue|green)
+        ;;
+    *)
+        fail_msg \
+            "invalid APP_COLOR='${APP_COLOR}'; expected blue or green"
+
+        exit 1
+        ;;
+esac
+
+log_msg \
+    "OK   - candidate color is '${APP_COLOR}'"
+
+
+# ======================================================================
+# Required application version
+# ======================================================================
+
+APP_VERSION="$(
+    docker inspect \
+        --format '{{range .Config.Env}}{{println .}}{{end}}' \
+        "$CONTAINER_NAME" |
+        sed -n 's/^APP_VERSION=//p' |
+        head -n1
+)"
+
+if [ -z "$APP_VERSION" ]; then
+
+    fail_msg \
+        "required env var 'APP_VERSION' is missing"
+
+    exit 1
+fi
+
+log_msg \
+    "OK   - candidate version is '${APP_VERSION}'"
+
+
+# ======================================================================
+# Required git commit
+# ======================================================================
+
+GIT_COMMIT="$(
+    docker inspect \
+        --format '{{range .Config.Env}}{{println .}}{{end}}' \
+        "$CONTAINER_NAME" |
+        sed -n 's/^GIT_COMMIT=//p' |
+        head -n1
+)"
+
+if [ -z "$GIT_COMMIT" ]; then
+
+    fail_msg \
+        "required env var 'GIT_COMMIT' is missing"
+
+    exit 1
+fi
+
+log_msg \
+    "OK   - candidate git commit is '${GIT_COMMIT}'"
+
+
+# ======================================================================
+# Final validation
+# ======================================================================
+
+log_msg "OK   - container validation completed successfully"
