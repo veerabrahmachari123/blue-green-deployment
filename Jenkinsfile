@@ -58,7 +58,12 @@ pipeline {
 
         stage('Unit/Application Test') {
             steps {
-                sh "node app/test.js"
+                // Runs inside a throwaway node:20-alpine container (the same
+                // base image the Dockerfile uses) rather than requiring
+                // Node.js to be installed on the Jenkins host itself. This
+                // matters on a bare Windows Jenkins agent where only Docker
+                // is guaranteed to be present.
+                sh "docker run --rm -v \"${WORKSPACE}/app:/app\" -w /app node:20-alpine node test.js"
             }
         }
 
