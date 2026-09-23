@@ -53,11 +53,9 @@ fail_msg() {
 log_msg "Preparing blue/green candidate."
 
 
-#
 # ======================================================================
 # Validate required arguments
 # ======================================================================
-#
 
 if [ -z "$IMAGE_TAG" ]; then
     fail_msg "image tag is empty"
@@ -75,11 +73,9 @@ if [ -z "$GIT_COMMIT" ]; then
 fi
 
 
-#
 # ======================================================================
 # Validate secret file
 # ======================================================================
-#
 
 if [ ! -f "$SECRET_ENV_FILE" ]; then
 
@@ -96,10 +92,6 @@ if [ ! -r "$SECRET_ENV_FILE" ]; then
     exit 1
 fi
 
-#
-# Validate required variable without printing its value.
-#
-
 if ! grep -q '^ORDERS_API_SECRET=' "$SECRET_ENV_FILE"; then
 
     fail_msg "secret env file does not contain ORDERS_API_SECRET"
@@ -108,11 +100,9 @@ if ! grep -q '^ORDERS_API_SECRET=' "$SECRET_ENV_FILE"; then
 fi
 
 
-#
 # ======================================================================
 # Determine currently-live color
 # ======================================================================
-#
 
 BLUE_RUNNING=false
 GREEN_RUNNING=false
@@ -136,10 +126,6 @@ if docker ps \
 fi
 
 
-#
-# If exactly one application color is running, that is the current color.
-#
-
 if [ "$BLUE_RUNNING" = true ] && [ "$GREEN_RUNNING" = false ]; then
 
     CURRENT_COLOR="blue"
@@ -149,12 +135,6 @@ elif [ "$GREEN_RUNNING" = true ] && [ "$BLUE_RUNNING" = false ]; then
     CURRENT_COLOR="green"
 
 elif [ "$BLUE_RUNNING" = true ] && [ "$GREEN_RUNNING" = true ]; then
-
-    #
-    # Both are running.
-    #
-    # Use the router's ACTIVE_COLOR to determine production traffic.
-    #
 
     router_target=""
 
@@ -199,12 +179,6 @@ elif [ "$BLUE_RUNNING" = true ] && [ "$GREEN_RUNNING" = true ]; then
 
 else
 
-    #
-    # No application container is currently running.
-    #
-    # Check router configuration if available.
-    #
-
     if docker ps \
         --filter "name=^${ROUTER_CONTAINER}$" \
         --format '{{.Names}}' |
@@ -232,11 +206,9 @@ else
 fi
 
 
-#
 # ======================================================================
 # If still unknown, inspect existing stopped containers
 # ======================================================================
-#
 
 if [ -z "$CURRENT_COLOR" ]; then
 
@@ -256,22 +228,14 @@ if [ -z "$CURRENT_COLOR" ]; then
 
     else
 
-        #
-        # Completely empty environment.
-        #
-        # Initialize blue as the production/current side.
-        #
-
         CURRENT_COLOR="blue"
     fi
 fi
 
 
-#
 # ======================================================================
 # Select candidate color
 # ======================================================================
-#
 
 case "$CURRENT_COLOR" in
 
@@ -307,40 +271,16 @@ log_msg "Candidate container: ${CANDIDATE_NAME}"
 log_msg "Candidate port: ${CANDIDATE_PORT}"
 
 
-#
 # ======================================================================
-# Make sure candidate container is not already running
+# Remove existing candidate container
 # ======================================================================
-#
-
-if docker ps \
-    --filter "name=^${CANDIDATE_NAME}$" \
-    --filter "status=running" \
-    --format '{{.Names}}' |
-    grep -q "^${CANDIDATE_NAME}$"; then
-
-    log_msg "Existing ${CANDIDATE_NAME} candidate detected."
-
-    log_msg "Stopping/removing existing candidate."
-
-    docker rm -f "$CANDIDATE_NAME" \
-        >/dev/null 2>&1 ||
-        true
-fi
-
-
-#
-# ======================================================================
-# Remove stale stopped candidate container
-# ======================================================================
-#
 
 if docker ps -a \
     --filter "name=^${CANDIDATE_NAME}$" \
     --format '{{.Names}}' |
     grep -q "^${CANDIDATE_NAME}$"; then
 
-    log_msg "Removing stale ${CANDIDATE_NAME} container."
+    log_msg "Removing existing ${CANDIDATE_NAME} container."
 
     docker rm -f "$CANDIDATE_NAME" \
         >/dev/null 2>&1 ||
@@ -348,11 +288,9 @@ if docker ps -a \
 fi
 
 
-#
 # ======================================================================
 # Make sure Docker network exists
 # ======================================================================
-#
 
 if ! docker network inspect "$NETWORK_NAME" \
     >/dev/null 2>&1; then
@@ -363,11 +301,9 @@ if ! docker network inspect "$NETWORK_NAME" \
 fi
 
 
-#
 # ======================================================================
 # Make sure database container is connected to the network
 # ======================================================================
-#
 
 if docker ps \
     --filter "name=^${DB_CONTAINER}$" \
@@ -387,11 +323,9 @@ else
 fi
 
 
-#
 # ======================================================================
-# Validate image exists before starting candidate
+# Validate image exists
 # ======================================================================
-#
 
 if ! docker image inspect "$IMAGE_TAG" \
     >/dev/null 2>&1; then
@@ -402,27 +336,14 @@ if ! docker image inspect "$IMAGE_TAG" \
 fi
 
 
-#
 # ======================================================================
 # Start candidate
 # ======================================================================
-#
 
 log_msg "Starting ${CANDIDATE_COLOR} candidate."
 log_msg "Container: ${CANDIDATE_NAME}"
 log_msg "Image: ${IMAGE_TAG}"
 log_msg "Port: ${CANDIDATE_PORT}"
-
-
-#
-# IMPORTANT:
-#
-# The secret file is passed directly to Docker.
-# Its contents are never printed.
-#
-# MSYS_NO_PATHCONV is intentionally NOT set globally.
-# The secret file is a host-side path and should remain a host path.
-#
 
 docker run -d \
     --name "$CANDIDATE_NAME" \
@@ -437,20 +358,16 @@ docker run -d \
     "$IMAGE_TAG"
 
 
-#
 # ======================================================================
-# Give Docker a moment to register/start the container
+# Give Docker a moment to start the container
 # ======================================================================
-#
 
 sleep 2
 
 
-#
 # ======================================================================
-# Validate candidate container is running
+# Validate candidate container
 # ======================================================================
-#
 
 if ! docker ps \
     --filter "name=^${CANDIDATE_NAME}$" \
@@ -478,11 +395,9 @@ if ! docker ps \
 fi
 
 
-#
 # ======================================================================
-# Validate container metadata
+# Validate candidate image
 # ======================================================================
-#
 
 actual_image="$(
     docker inspect \
@@ -495,16 +410,10 @@ if [ "$actual_image" != "$IMAGE_TAG" ]; then
     fail_msg \
         "candidate container is using unexpected image: ${actual_image}"
 
-    docker inspect \
-        --format '{{.Config.Image}}' \
-        "$CANDIDATE_NAME" ||
-        true
-
     exit 1
 fi
 
 
-#
 # ======================================================================
 # Output deployment state
 #
@@ -512,7 +421,6 @@ fi
 #
 # NEVER output ORDERS_API_SECRET.
 # ======================================================================
-#
 
 echo "CURRENT_COLOR=${CURRENT_COLOR}"
 echo "CANDIDATE_COLOR=${CANDIDATE_COLOR}"

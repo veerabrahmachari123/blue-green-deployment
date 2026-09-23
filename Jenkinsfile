@@ -15,16 +15,6 @@ pipeline {
         NETWORK_NAME = 'orders-network'
         ROUTER_CONTAINER = 'orders-router'
         DB_CONTAINER = 'orders-db'
-
-        /*
-         * DO NOT set MSYS_NO_PATHCONV globally.
-         *
-         * Windows Jenkins + Git Bash needs normal path conversion for
-         * docker build.
-         *
-         * Enable MSYS_NO_PATHCONV=1 only around docker run commands
-         * that contain Linux container paths such as /app.
-         */
     }
 
     options {
@@ -38,12 +28,6 @@ pipeline {
     }
 
     stages {
-
-        /*
-         * ================================================================
-         * CHECKOUT
-         * ================================================================
-         */
 
         stage('Checkout') {
             steps {
@@ -67,12 +51,6 @@ pipeline {
             }
         }
 
-
-        /*
-         * ================================================================
-         * VALIDATE VERSION
-         * ================================================================
-         */
 
         stage('Validate Version') {
             steps {
@@ -98,12 +76,6 @@ pipeline {
             }
         }
 
-
-        /*
-         * ================================================================
-         * UNIT / APPLICATION TEST
-         * ================================================================
-         */
 
         stage('Unit/Application Test') {
             steps {
@@ -131,19 +103,9 @@ pipeline {
 
                     echo "Running Node.js tests inside node:20-alpine..."
 
-                    /*
-                     * Windows Jenkins uses Git Bash.
-                     *
-                     * Without MSYS_NO_PATHCONV=1 Git Bash can transform:
-                     *
-                     *     /app
-                     *
-                     * into:
-                     *
-                     *     C:/Program Files/Git/app
-                     *
-                     * which breaks Docker's container working directory.
-                     */
+                    # Windows Jenkins uses Git Bash.
+                    # Disable MSYS path conversion only for this Docker
+                    # command because /app is a Linux container path.
 
                     MSYS_NO_PATHCONV=1 docker run --rm \
                         -v "${WORKSPACE}/app:/app" \
@@ -158,12 +120,6 @@ pipeline {
             }
         }
 
-
-        /*
-         * ================================================================
-         * DOCKER BUILD
-         * ================================================================
-         */
 
         stage('Docker Build') {
             steps {
@@ -182,24 +138,21 @@ pipeline {
                     ).trim()
 
                     if (!buildOutput) {
-                        error('Docker build script returned no output.')
+                        error(
+                            'Docker build script returned no output.'
+                        )
                     }
 
                     def lines = buildOutput.readLines()
 
-                    /*
-                     * build-image.sh must print the final image tag
-                     * as its LAST line.
-                     */
                     env.IMAGE_TAG = lines[-1].trim()
 
                     if (!env.IMAGE_TAG) {
-                        error('Docker build did not return an image tag.')
+                        error(
+                            'Docker build did not return an image tag.'
+                        )
                     }
 
-                    /*
-                     * Basic image-tag sanity check.
-                     */
                     if (!env.IMAGE_TAG.startsWith("${env.IMAGE_NAME}:")) {
                         error(
                             "Invalid image tag returned by build-image.sh: ${env.IMAGE_TAG}"
@@ -211,12 +164,6 @@ pipeline {
             }
         }
 
-
-        /*
-         * ================================================================
-         * DOCKER IMAGE VALIDATION
-         * ================================================================
-         */
 
         stage('Docker Image Validation') {
             steps {
@@ -231,35 +178,8 @@ pipeline {
         }
 
 
-        /*
-         * ================================================================
-         * START CANDIDATE
-         * ================================================================
-         */
-
         stage('Start Candidate') {
             steps {
-
-                /*
-                 * Jenkins credential setup:
-                 *
-                 * Create:
-                 *
-                 *   Kind: Secret text
-                 *   ID: orders-api-secret
-                 *
-                 * The value should be the actual value of
-                 * ORDERS_API_SECRET.
-                 *
-                 * Jenkins injects the secret into:
-                 *
-                 *   ORDERS_API_SECRET_VALUE
-                 *
-                 * We create the temporary env file expected by
-                 * start-candidate.sh.
-                 *
-                 * The file is deleted in the finally block.
-                 */
 
                 withCredentials([
                     string(
@@ -277,16 +197,6 @@ pipeline {
                             "${secretDir}/orders-api.env"
 
                         try {
-
-                            /*
-                             * IMPORTANT:
-                             *
-                             * Do not interpolate the secret into a
-                             * Groovy triple-quoted string.
-                             *
-                             * Let the shell expand the Jenkins-provided
-                             * environment variable.
-                             */
 
                             sh '''
                                 set -e
@@ -323,14 +233,6 @@ pipeline {
 
                             echo out
 
-                            /*
-                             * Parse deployment metadata returned by
-                             * start-candidate.sh.
-                             *
-                             * Never copy ORDERS_API_SECRET into Jenkins
-                             * environment variables.
-                             */
-
                             out.split('\\n').each { line ->
 
                                 if (line.contains('=')) {
@@ -353,11 +255,6 @@ pipeline {
                                     }
                                 }
                             }
-
-                            /*
-                             * Verify that the candidate metadata needed
-                             * by the following stages was actually returned.
-                             */
 
                             if (!env.CURRENT_COLOR) {
                                 error(
@@ -385,10 +282,6 @@ pipeline {
 
                         } finally {
 
-                            /*
-                             * Always remove the temporary secret file.
-                             */
-
                             sh '''
                                 rm -f \
                                     "$WORKSPACE/scripts/secrets/orders-api.env" \
@@ -405,12 +298,6 @@ pipeline {
         }
 
 
-        /*
-         * ================================================================
-         * CONTAINER VALIDATION
-         * ================================================================
-         */
-
         stage('Container Validation') {
             steps {
 
@@ -422,12 +309,6 @@ pipeline {
             }
         }
 
-
-        /*
-         * ================================================================
-         * APPLICATION HEALTH CHECK
-         * ================================================================
-         */
 
         stage('Application Health Check') {
             steps {
@@ -443,12 +324,6 @@ pipeline {
         }
 
 
-        /*
-         * ================================================================
-         * INTEGRATION CHECK
-         * ================================================================
-         */
-
         stage('Integration Check') {
             steps {
 
@@ -462,12 +337,6 @@ pipeline {
         }
 
 
-        /*
-         * ================================================================
-         * TRAFFIC SWITCH
-         * ================================================================
-         */
-
         stage('Traffic Switch') {
             steps {
 
@@ -479,12 +348,6 @@ pipeline {
             }
         }
 
-
-        /*
-         * ================================================================
-         * OLD VERSION CLEANUP
-         * ================================================================
-         */
 
         stage('Old Version Cleanup') {
             steps {
@@ -500,12 +363,6 @@ pipeline {
             }
         }
 
-
-        /*
-         * ================================================================
-         * DEPLOYMENT VERIFICATION
-         * ================================================================
-         */
 
         stage('Deployment Verification') {
             steps {
@@ -526,12 +383,6 @@ pipeline {
     }
 
 
-    /*
-     * ====================================================================
-     * POST ACTIONS
-     * ====================================================================
-     */
-
     post {
 
         failure {
@@ -539,11 +390,6 @@ pipeline {
             script {
 
                 echo "Build FAILED. Production traffic was not intentionally switched."
-
-                /*
-                 * If candidate metadata is available, remove/rollback
-                 * the candidate without touching production traffic.
-                 */
 
                 if (env.CANDIDATE_COLOR &&
                     env.CURRENT_COLOR) {
@@ -586,10 +432,9 @@ pipeline {
             sh '''
                 docker ps \
                     --filter name=orders- \
-                    --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}' \
+                    --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' \
                     || true
             '''
         }
     }
 }
-
